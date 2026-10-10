@@ -1,0 +1,213 @@
+---
+- name: Install ClickHouse (download .deb packages)
+  hosts: clickhouse
+  become: true
+  vars:
+    clickhouse_deb_version: "22.3.3.44"
+    clickhouse_deb_url: "https://packages.clickhouse.com/deb/pool/main/c"
+    clickhouse_debs:
+      - name: clickhouse-common-static
+        arch: amd64
+      - name: clickhouse-client
+        arch: all
+      - name: clickhouse-server
+        arch: all
+  handlers:
+    - name: Start clickhouse service
+      ansible.builtin.systemd:
+        name: clickhouse-server
+        state: started
+        enabled: true
+
+  tasks:
+    - name: Install tzdata
+      ansible.builtin.apt:
+        name: tzdata
+        state: present
+
+    - name: Download ClickHouse .deb packages
+      ansible.builtin.get_url:
+        url: "{{ clickhouse_deb_url }}/{{ item.name }}/{{ item.name }}_{{ clickhouse_deb_version }}_{{ item.arch }}.deb"
+        dest: "/tmp/{{ item.name }}_{{ clickhouse_deb_version }}_{{ item.arch }}.deb"
+        mode: '0644'
+        timeout: 300
+      loop: "{{ clickhouse_debs }}"
+
+    - name: Install ClickHouse packages via apt
+      ansible.builtin.apt:
+        deb: "/tmp/{{ item.name }}_{{ clickhouse_deb_version }}_{{ item.arch }}.deb"
+        state: present
+      loop: "{{ clickhouse_debs }}"
+      notify: Start clickhouse service
+
+    - name: Flush handlers
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for clickhouse to start
+      ansible.builtin.wait_for:
+        port: 9000
+        delay: 5
+        timeout: 60
+
+    - name: Create database
+      ansible.builtin.command: "clickhouse-client -q 'create database logs;'"
+      register: create_db
+      failed_when: create_db.rc != 0 and create_db.rc != 82
+      changed_when: create_db.rc == 0
+
+- name: Install and configure Vector
+  hosts: vector
+  become: true
+  handlers:
+    - name: Restart vector service
+      ansible.builtin.shell:
+        cmd: |
+          pkill -x vector || true
+          sleep 2
+          nohup {{ vector_install_dir }}/bin/vector --config /etc/vector/vector.toml > /var/log/vector.log 2>&1 &
+      changed_when: false
+
+  tasks:
+    - name: Install ca-certificates and tar
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - tar
+          - gzip
+        state: present
+        update_cache: true
+
+    - name: Get vector distrib
+      ansible.builtin.get_url:
+        url: "https://packages.timber.io/vector/{{ vector_version }}/vector-{{ vector_version }}-x86_64-unknown-linux-gnu.tar.gz"
+        dest: "/tmp/vector-{{ vector_version }}.tar.gz"
+        mode: '0644'
+        timeout: 120
+
+    - name: Unarchive vector
+      ansible.builtin.unarchive:
+        src: "/tmp/vector-{{ vector_version }}.tar.gz"
+        dest: /opt/
+        remote_src: true
+        creates: "/opt/vector-x86_64-unknown-linux-gnu"
+
+    - name: Check if vector directory exists
+      ansible.builtin.stat:
+        path: /opt/vector
+      register: vector_dir
+
+    - name: Rename vector directory
+      ansible.builtin.command:
+        cmd: "mv /opt/vector-x86_64-unknown-linux-gnu /opt/vector"
+      when: not vector_dir.stat.exists
+      changed_when: true
+
+    - name: Create vector config dir
+      ansible.builtin.file:
+        path: /etc/vector
+        state: directory
+        mode: '0755'
+
+    - name: Create vector data dir
+      ansible.builtin.file:
+        path: /var/lib/vector
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+
+    - name: Deploy vector config
+      ansible.builtin.template:
+        src: vector.toml.j2
+        dest: /etc/vector/vector.toml
+        mode: '0644'
+      notify: Restart vector service
+
+    - name: Ensure vector is running
+      ansible.builtin.shell:
+        cmd: |
+          if ! pgrep -x vector > /dev/null; then
+            nohup {{ vector_install_dir }}/bin/vector --config /etc/vector/vector.toml > /var/log/vector.log 2>&1 &
+            echo "started"
+          else
+            echo "already running"
+          fi
+      register: vec_status
+      changed_when: "'started' in vec_status.stdout"
+
+- name: Install and configure Lighthouse
+  hosts: lighthouse
+  become: true
+  handlers:
+    - name: Restart nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+
+  tasks:
+    - name: Install nginx and unzip
+      ansible.builtin.apt:
+        name:
+          - nginx
+          - unzip
+        state: present
+        update_cache: true
+
+    - name: Download lighthouse archive
+      ansible.builtin.get_url:
+        url: "{{ lighthouse_archive_url }}"
+        dest: /tmp/lighthouse.zip
+        mode: '0644'
+        timeout: 120
+
+    - name: Create lighthouse parent directory
+      ansible.builtin.file:
+        path: /var/www
+        state: directory
+        mode: '0755'
+
+    - name: Unarchive lighthouse to /var/www
+      ansible.builtin.unarchive:
+        src: /tmp/lighthouse.zip
+        dest: /var/www/
+        remote_src: true
+        creates: /var/www/lighthouse
+
+    - name: Check if lighthouse directory exists
+      ansible.builtin.stat:
+        path: /var/www/lighthouse
+      register: lighthouse_dir_stat
+
+    - name: Rename lighthouse-master to lighthouse
+      ansible.builtin.command:
+        cmd: "mv /var/www/lighthouse-master /var/www/lighthouse"
+      when: not lighthouse_dir_stat.stat.exists
+      changed_when: true
+
+    - name: Fix lighthouse directory permissions
+      ansible.builtin.file:
+        path: /var/www/lighthouse
+        state: directory
+        mode: '0755'
+        recurse: true
+      changed_when: false
+
+    - name: Deploy nginx config for lighthouse
+      ansible.builtin.template:
+        src: nginx-lighthouse.conf.j2
+        dest: /etc/nginx/sites-available/lighthouse
+        mode: '0644'
+      notify: Restart nginx
+
+    - name: Enable lighthouse site
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/lighthouse
+        dest: /etc/nginx/sites-enabled/lighthouse
+        state: link
+      notify: Restart nginx
+
+    - name: Remove default nginx site
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: Restart nginx

@@ -1,0 +1,8 @@
+[sources.vector_logs]
+type = "file"
+include = ["/var/log/*.log"]
+
+[sinks.console]
+type = "console"
+inputs = ["vector_logs"]
+encoding.codec = "json"
